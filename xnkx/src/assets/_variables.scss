@@ -1,0 +1,30 @@
+@use "sass:map" as map;
+
+// Breakpoints and variables for responsive design
+$breakpoints: (
+  xs: 0,
+  sm: 768px,
+  md: 992px,
+  lg: 1200px,
+  xl: 1920px
+);
+
+$container-max-width: 100vw;
+
+$gutter: 1rem;
+
+// fluid type scale (mobile-first)
+$base-font-size: 15px;
+$scale-ratio: 1.12;
+
+@mixin respond($size) {
+  $val: map.get($breakpoints, $size);
+  @if $val == 0 {
+    @content;
+  } @else {
+    // Desktop-first: apply styles for screens up to the breakpoint (max-width)
+    // subtract 1px so breakpoints don't overlap (e.g. md -> max-width: 767px)
+    $max: $val - 1px;
+    @media (max-width: $max) { @content; }
+  }
+}
