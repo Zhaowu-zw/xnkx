@@ -1,7 +1,70 @@
 const accessService = require('./accessService');
 const redisClient = require('../utils/redis');
-const { sequelize, activity, group_info, user, recruitment, accesssummary, approval, feedback } = require('../models');
+const { sequelize, activity, group_info, user, recruitment, accesssummary, approval, feedback, accesslog } = require('../models');
 const { Op } = require('sequelize');
+const schedule = require('node-schedule');
+
+// 添加定时任务：每天凌晨2点清除超过一个月的访问记录
+schedule.scheduleJob('0 2 * * *', async () => {
+    try {
+        console.log('开始执行定时任务：清除超过一个月的访问记录');
+        
+        const oneMonthAgo = new Date();
+        oneMonthAgo.setDate(oneMonthAgo.getDate() - 30);
+        const oneMonthAgoDateStr = oneMonthAgo.toISOString().split('T')[0];
+        
+        // 清除accesslog表中超过一个月的记录
+        const accesslogDeleteCount = await accesslog.destroy({
+            where: {
+                accessTime: { [Op.lt]: oneMonthAgo }
+            }
+        });
+        console.log(`清除了 ${accesslogDeleteCount} 条超过一个月的访问日志记录`);
+        
+        // 清除accesssummary表中超过一个月的记录
+        const accesssummaryDeleteCount = await accesssummary.destroy({
+            where: {
+                statDate: { [Op.lt]: oneMonthAgoDateStr }
+            }
+        });
+        console.log(`清除了 ${accesssummaryDeleteCount} 条超过一个月的访问量汇总记录`);
+        
+        // 清除审批记录中超过一年的已处理记录
+        const oneYearAgo = new Date();
+        oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+        const approvalDeleteCount = await approval.destroy({
+            where: {
+                approval_status: { [Op.ne]: 'pending' },
+                updatedAt: { [Op.lt]: oneYearAgo }
+            }
+        });
+        console.log(`清除了 ${approvalDeleteCount} 条超过一年的已处理审批记录`);
+        
+        // 清除反馈记录中超过一年的已处理记录
+        const feedbackDeleteCount = await feedback.destroy({
+            where: {
+                status: { [Op.ne]: 0 },
+                updated_at: { [Op.lt]: oneYearAgo }
+            }
+        });
+        console.log(`清除了 ${feedbackDeleteCount} 条超过一年的已处理反馈记录`);
+        
+        console.log('定时任务执行完成：清除超过一个月的访问记录');
+    } catch (error) {
+        console.error('定时任务执行失败：清除超过一个月的访问记录', error);
+    }
+});
+
+// 添加定时任务：每小时更新一次统计数据缓存
+schedule.scheduleJob('0 * * * *', async () => {
+    try {
+        console.log('开始执行定时任务：更新统计数据缓存');
+        await getAllStatData();
+        console.log('定时任务执行完成：更新统计数据缓存');
+    } catch (error) {
+        console.error('定时任务执行失败：更新统计数据缓存', error);
+    }
+});
 
 /**
  * 通用数值格式化函数（保留1位小数，处理0/整数/小数）
@@ -162,20 +225,45 @@ const getAllStatData = async () => {
         }));
 
         // ========== 5. 月度活动发布量 ==========
+        // 获取最近6个月的时间范围
+        const startDate = new Date(now.getFullYear(), now.getMonth() - 5, 1);
+        const endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+        
+        // 查询最近6个月的活动发布量
         const activityRawData = await activity.findAll({
             attributes: [
                 [sequelize.fn('DATE_FORMAT', sequelize.col('createdAt'), '%m月'), 'month'],
                 [sequelize.fn('COUNT', sequelize.col('id')), 'count']
             ],
             where: {
-                createdAt: { [Op.gte]: new Date(now.getFullYear(), now.getMonth() - 4, 1) }
+                createdAt: { [Op.between]: [startDate, endDate] }
             },
             group: [sequelize.fn('DATE_FORMAT', sequelize.col('createdAt'), '%m月')],
             order: [sequelize.fn('DATE_FORMAT', sequelize.col('createdAt'), '%m月')],
             raw: true
         });
-        const monthlyActivity = activityRawData.map((item, index) => {
-            const prevItem = activityRawData[index - 1];
+        
+        // 生成最近6个月的月份数组（确保连续性）
+        const months = [];
+        for (let i = 5; i >= 0; i--) {
+            const month = new Date(now.getFullYear(), now.getMonth() - i, 1);
+            months.push(month.getMonth() + 1 + '月');
+        }
+        
+        // 将查询结果转换为对象，方便查找
+        const activityMap = new Map();
+        activityRawData.forEach(item => {
+            activityMap.set(item.month, parseInt(item.count));
+        });
+        
+        // 确保每个月都有数据，没有数据的月份显示0
+        const filledActivityData = months.map(month => ({
+            month,
+            count: activityMap.get(month) || 0
+        }));
+        // 计算月度活动发布量的趋势
+        const monthlyActivity = filledActivityData.map((item, index) => {
+            const prevItem = filledActivityData[index - 1];
             const trend = prevItem ? calculateTrend(parseInt(item.count), parseInt(prevItem.count)) : formatNumber(0);
             return {
                 month: item.month,
@@ -185,43 +273,88 @@ const getAllStatData = async () => {
         });
 
         // ========== 6. 月度新增用户 ==========
+        // 获取最近6个月的时间范围
+        const startDateNewUser = new Date(now.getFullYear(), now.getMonth() - 5, 1);
+        const endDateNewUser = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+        
+        // 查询最近6个月的新增用户数
         const newUserRawData = await user.findAll({
             attributes: [
                 [sequelize.fn('DATE_FORMAT', sequelize.col('createtime'), '%m月'), 'month'],
                 [sequelize.fn('COUNT', sequelize.col('id')), 'count']
             ],
             where: {
-                createtime: { [Op.gte]: new Date(now.getFullYear(), now.getMonth() - 5, 1) }
+                createtime: { [Op.between]: [startDateNewUser, endDateNewUser] }
             },
             group: [sequelize.fn('DATE_FORMAT', sequelize.col('createtime'), '%m月')],
             order: [sequelize.fn('DATE_FORMAT', sequelize.col('createtime'), '%m月')],
             raw: true
         });
-        const monthlyNewUser = newUserRawData.map(item => ({
+        
+        // 生成最近6个月的月份数组（确保连续性）
+        const newUserMonths = [];
+        for (let i = 5; i >= 0; i--) {
+            const month = new Date(now.getFullYear(), now.getMonth() - i, 1);
+            newUserMonths.push(month.getMonth() + 1 + '月');
+        }
+        
+        // 将查询结果转换为对象，方便查找
+        const newUserMap = new Map();
+        newUserRawData.forEach(item => {
+            newUserMap.set(item.month, parseInt(item.count));
+        });
+        
+        // 确保每个月都有数据，没有数据的月份显示0
+        const filledNewUserData = newUserMonths.map(month => ({
+            month,
+            count: newUserMap.get(month) || 0
+        }));
+        
+        // 计算月度新增用户数的进度
+        const monthlyNewUser = filledNewUserData.map(item => ({
             month: item.month,
             count: formatNumber(item.count),
             progress: formatNumber(Math.min((item.count / 50) * 100, 100))
         }));
 
         // ========== 7. 各组今年纳新人数 ==========
+        // 获取今年的时间范围
+        const startOfYear = new Date(now.getFullYear(), 0, 1);
+        const endOfYear = new Date(now.getFullYear(), 11, 31);
+        
+        // 首先获取所有小组信息
+        const allGroups = await group_info.findAll({
+            attributes: ['id', 'group_name'],
+            raw: true
+        });
+        
+        // 查询今年的纳新记录，按小组分组
         const recruitRawData = await recruitment.findAll({
             attributes: [
                 'intention_group_id',
                 [sequelize.fn('COUNT', sequelize.col('id')), 'recruitCount']
             ],
+            where: {
+                update_time: { [Op.between]: [startOfYear, endOfYear] }
+            },
             group: ['intention_group_id'],
             raw: true
         });
-        const groupRecruit = [];
-        for (const item of recruitRawData) {
-            const group = await group_info.findByPk(item.intention_group_id);
-            if (group) {
-                groupRecruit.push({
-                    groupName: group.group_name,
-                    recruitCount: formatNumber(item.recruitCount)
-                });
-            }
-        }
+        
+        // 将纳新记录转换为对象，方便查找
+        const recruitMap = new Map();
+        recruitRawData.forEach(item => {
+            recruitMap.set(item.intention_group_id, parseInt(item.recruitCount));
+        });
+        
+        // 组装所有小组的纳新数据，没有纳新记录的小组显示0
+        const groupRecruit = allGroups.map(group => ({
+            groupName: group.group_name,
+            recruitCount: formatNumber(recruitMap.get(group.id) || 0)
+        }));
+        
+        // 按小组名称排序
+        groupRecruit.sort((a, b) => a.groupName.localeCompare(b.groupName));
 
         // ========== 8. 各组人员比例 ==========
         const memberRawData = await user.findAll({
@@ -272,8 +405,23 @@ const getAllStatData = async () => {
         };
 
         // 11. 将结果存入Redis，设置10分钟过期时间
-        await redisClient.set(cacheKey, JSON.stringify(result), 600);
+        await redisClient.set(cacheKey, JSON.stringify(result), 60);
         console.log('统计数据存入Redis缓存');
+        
+        // 设置单独的缓存键用于未处理审批记录，较短的过期时间
+        const pendingRecruitCacheKey = 'stat_pending_recruit';
+        await redisClient.set(pendingRecruitCacheKey, JSON.stringify({ pendingRecruitCount, trendPendingRecruit }), 30);
+        console.log('未处理审批记录存入Redis缓存');
+        
+        // 设置单独的缓存键用于未处理反馈，较短的过期时间
+        const unhandledFeedbackCacheKey = 'stat_unhandled_feedback';
+        await redisClient.set(unhandledFeedbackCacheKey, JSON.stringify({ unhandledFeedbackCount, trendUnhandledFeedback }), 30);
+        console.log('未处理反馈记录存入Redis缓存');
+        
+        // 设置单独的缓存键用于今日访问量，较短的过期时间
+        const todayVisitCacheKey = 'stat_today_visit';
+        await redisClient.set(todayVisitCacheKey, JSON.stringify({ todayVisitCount, trendTodayVisit }), 30);
+        console.log('今日访问量存入Redis缓存');
 
         return result;
     } catch (error) {

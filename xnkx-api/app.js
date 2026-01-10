@@ -24,6 +24,7 @@ const clubAchievementRouter = require('./routes/clubachievement')
 const groupAchievementRouter = require('./routes/groupachievements')
 const accessRouter=require('./routes/access');
 const approvalRouter = require('./routes/approvals');
+const systemConfigRouter = require('./routes/systemConfig');
 
 const app = express();
 
@@ -85,6 +86,9 @@ app.use('/clubAchievement', clubAchievementRouter);
 app.use('/groupAchievement', groupAchievementRouter);
 //审批信息s
 app.use('/approval', authMiddleware, approvalRouter);
+
+//系统配置路由
+app.use('/system', systemConfigRouter);
 
 app.use('', accessRouter);
 

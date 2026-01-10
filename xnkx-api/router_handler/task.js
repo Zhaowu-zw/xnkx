@@ -304,12 +304,11 @@ const editTask = async function (req, res) {
         }
         console.log('更新状态:', status);
         
-        // 开始事务
-        await sequelize.transaction(async (t) => {
+        // 开始事务 - 设置隔离级别为 READ COMMITTED
+        await sequelize.transaction({ isolationLevel: Sequelize.Transaction.ISOLATION_LEVELS.READ_COMMITTED }, async (t) => {
             // 计算更新后的状态
             const updatedStatus = status || tasks.status;
-            console.log('更新后的状态:', updatedStatus);
-            console.log('当前状态:', tasks.status);
+            
             // 更新任务表
             await tasks.update({
                 title: trimmedTitle,
@@ -320,11 +319,9 @@ const editTask = async function (req, res) {
                 group_id: task_type === 'club' ? null : (group_id || tasks.group_id),
                 assessment_criteria: assessment_criteria || tasks.assessment_criteria
             }, { transaction: t });
-            console.log('当前状态2:', tasks.status);
-            console.log('状态是否改变:', updatedStatus !== tasks.status);
             
             // 如果状态改变，更新所有相关用户的任务状态
-            if (updatedStatus == tasks.status) {
+            if (updatedStatus !== tasks.status) {
                 await task_user.update(
                     { status: updatedStatus },
                     { 
@@ -431,16 +428,46 @@ const updateTaskStatus = async function (req, res) {
             throw new NotFoundError('任务用户关联记录不存在');
         }
 
-        // 更新任务状态
-        await task_user.update({ status }, {
-            where: updateCondition
-        });
+        // 重试机制：处理死锁情况
+        const maxRetries = 3;
+        let retryCount = 0;
+        let operationSuccess = false;
 
-        // 如果是结束所有用户的任务状态，同时更新task表中的状态
-        if (end_all) {
-            await task.update({ status }, {
-                where: { id: task_id }
-            });
+        while (retryCount < maxRetries && !operationSuccess) {
+            try {
+                // 根据end_all的值决定是否使用事务
+                if (end_all) {
+                    // 当end_all=true时，需要更新多张表，使用事务
+                    await sequelize.transaction({ isolationLevel: Sequelize.Transaction.ISOLATION_LEVELS.READ_COMMITTED }, async (t) => {
+                        // 更新所有相关用户的任务状态
+                        await task_user.update({ status }, {
+                            where: { task_id: task_id },
+                            transaction: t
+                        });
+
+                        // 更新任务表的状态
+                        await task.update({ status }, {
+                            where: { id: task_id },
+                            transaction: t
+                        });
+                    });
+                } else {
+                    // 当end_all=false时，只更新单表，不需要事务，减少锁的持有时间
+                    await task_user.update({ status }, {
+                        where: updateCondition
+                    });
+                }
+
+                operationSuccess = true;
+            } catch (error) {
+                retryCount++;
+                if (retryCount >= maxRetries || !error.message.includes('Deadlock found when trying to get lock')) {
+                    throw error;
+                }
+                console.log(`发生死锁，正在重试... (${retryCount}/${maxRetries})`);
+                // 等待一段时间后重试，避免立即重试导致再次死锁
+                await new Promise(resolve => setTimeout(resolve, 100 * retryCount));
+            }
         }
 
         success(res, '更改任务状态成功');
@@ -498,13 +525,32 @@ const submitTaskResult = async function (req, res) {
         // 提交后自动将状态更新为已完成
         updateData.status = 'completed';
         
-        // 更新任务成果
-        await task_user.update(updateData, {
-            where: {
-                user_id: userId,
-                task_id: task_id
+        // 重试机制：处理死锁情况
+        const maxRetries = 3;
+        let retryCount = 0;
+        let operationSuccess = false;
+
+        while (retryCount < maxRetries && !operationSuccess) {
+            try {
+                // 更新任务成果 - 只更新单表，不需要事务，减少锁的持有时间
+                await task_user.update(updateData, {
+                    where: {
+                        user_id: userId,
+                        task_id: task_id
+                    }
+                });
+
+                operationSuccess = true;
+            } catch (error) {
+                retryCount++;
+                if (retryCount >= maxRetries || !error.message.includes('Deadlock found when trying to get lock')) {
+                    throw error;
+                }
+                console.log(`提交任务成果发生死锁，正在重试... (${retryCount}/${maxRetries})`);
+                // 等待一段时间后重试，避免立即重试导致再次死锁
+                await new Promise(resolve => setTimeout(resolve, 100 * retryCount));
             }
-        });
+        }
         
         success(res, '提交任务成果成功');
     } catch (error) {
@@ -546,11 +592,30 @@ const scoreTaskResult = async function (req, res) {
             throw new NotFoundError('任务用户关联记录不存在');
         }
         
-        // 更新评分
-        await task_user.update(
-            { score: score },
-            { where: updateCondition }
-        );
+        // 重试机制：处理死锁情况
+        const maxRetries = 3;
+        let retryCount = 0;
+        let operationSuccess = false;
+
+        while (retryCount < maxRetries && !operationSuccess) {
+            try {
+                // 更新评分 - 只更新单表，不需要事务，减少锁的持有时间
+                await task_user.update(
+                    { score: score },
+                    { where: updateCondition }
+                );
+
+                operationSuccess = true;
+            } catch (error) {
+                retryCount++;
+                if (retryCount >= maxRetries || !error.message.includes('Deadlock found when trying to get lock')) {
+                    throw error;
+                }
+                console.log(`评分任务成果发生死锁，正在重试... (${retryCount}/${maxRetries})`);
+                // 等待一段时间后重试，避免立即重试导致再次死锁
+                await new Promise(resolve => setTimeout(resolve, 100 * retryCount));
+            }
+        }
         
         success(res, '评分任务成果成功');
     } catch (error) {
